@@ -1,7 +1,7 @@
 """
 Sicily property listing watcher.
 
-Fetches a set of saved search pages (currently Immobiliare.it), figures out
+Fetches a set of saved search pages (currently Gate-away.com), figures out
 which listings are new since the last run, scores them against your budget
 and keywords, and emails you a prioritized summary.
 
@@ -27,20 +27,16 @@ from bs4 import BeautifulSoup
 
 SEARCHES = [
     {
-        "name": "Avola - sea view",
-        "url": "https://www.immobiliare.it/en/vendita-case/avola/con-vista-mare/",
+        "name": "Avola",
+        "url": "https://www.gate-away.com/properties/sicily/syracuse/avola",
     },
     {
-        "name": "Avola - cheap houses",
-        "url": "https://www.immobiliare.it/en/vendita-case/avola/con-prezzo-basso/",
+        "name": "Ispica (covers Santa Maria del Focallo)",
+        "url": "https://www.gate-away.com/properties/sicily/ragusa/ispica",
     },
-    {
-        "name": "Santa Maria del Focallo - sea view",
-        "url": "https://www.immobiliare.it/en/vendita-case/ispica/santa-maria-del-focallo/con-vista-mare/",
-    },
-    # Add more saved-search URLs here following the same pattern.
-    # Idealista.it has a different page structure, so it isn't wired up yet —
-    # see the README for notes on adding it.
+    # Immobiliare.it is deliberately not included here — it's protected by
+    # DataDome, an anti-bot service that blocks plain HTTP requests outright.
+    # Add more Gate-away.com town pages here following the same pattern.
 ]
 
 MAX_BUDGET = 70_000  # purchase-price ceiling used for priority scoring
@@ -87,32 +83,26 @@ def parse_price(raw: str) -> int | None:
     return int(cleaned) if cleaned else None
 
 
-def parse_immobiliare(html: str) -> list[dict]:
+def parse_gateaway(html: str) -> list[dict]:
     """
-    Parse an Immobiliare.it search-results page.
+    Parse a Gate-away.com search-results page.
 
-    Rather than relying on exact CSS class names (which Immobiliare changes
-    periodically), this looks for links matching the canonical listing URL
-    pattern '/annunci/<id>/' and pulls the nearest price text as context.
-    That pattern is far more stable than any particular div/class name.
+    Listing URLs follow the stable pattern '.../id/<number>' regardless of
+    province or town. Each listing's link tends to appear more than once in
+    the page (photo, title, price each link separately), so this merges
+    everything seen for a given id rather than keeping just the first hit.
     """
     soup = BeautifulSoup(html, "html.parser")
-    listings = []
-    seen_ids = set()
+    found: dict = {}
 
-    for a_tag in soup.find_all("a", href=re.compile(r"/annunci/\d+/?")):
+    for a_tag in soup.find_all("a", href=re.compile(r"/id/\d+/?")):
         href = a_tag.get("href", "")
-        match = re.search(r"/annunci/(\d+)/?", href)
+        match = re.search(r"/id/(\d+)/?", href)
         if not match:
             continue
         listing_id = match.group(1)
-        if listing_id in seen_ids:
-            continue
-        seen_ids.add(listing_id)
 
         title = (a_tag.get("title") or a_tag.get_text(strip=True) or "").strip()
-        if not title:
-            continue
 
         price = None
         node = a_tag
@@ -120,23 +110,23 @@ def parse_immobiliare(html: str) -> list[dict]:
             node = node.parent
             if node is None:
                 break
-            price_match = re.search(r"€\s*([\d.,]+)", node.get_text(" ", strip=True))
+            price_match = re.search(r"([\d.,]+)\s*€", node.get_text(" ", strip=True))
             if price_match:
                 price = parse_price(price_match.group(1))
                 break
 
-        full_url = href if href.startswith("http") else f"https://www.immobiliare.it{href}"
+        full_url = href if href.startswith("http") else f"https://www.gate-away.com{href}"
 
-        listings.append(
-            {
-                "id": f"immobiliare_{listing_id}",
-                "title": title,
-                "price": price,
-                "link": full_url,
-            }
+        entry = found.setdefault(
+            listing_id,
+            {"id": f"gateaway_{listing_id}", "title": "", "price": None, "link": full_url},
         )
+        if len(title) > len(entry["title"]):
+            entry["title"] = title
+        if price is not None and entry["price"] is None:
+            entry["price"] = price
 
-    return listings
+    return [entry for entry in found.values() if entry["title"]]
 
 
 def fetch_url(url: str) -> tuple[int, str]:
@@ -176,18 +166,20 @@ def fetch_url(url: str) -> tuple[int, str]:
 def fetch_search(search: dict) -> list[dict]:
     status_code, html = fetch_url(search["url"])
 
-    print(f"  -> HTTP {status_code}, {len(html)} characters received")
+    # --- Diagnostics: figure out what we actually received ---
     lowered = html.lower()
+    print(f"  -> HTTP {status_code}, {len(html)} characters received")
     if "captcha" in lowered or "are you a human" in lowered or "access denied" in lowered or "cloudflare" in lowered:
         print("  -> Looks like a bot-check / block page, not the real listing page.")
-    if "/annunci/" not in lowered:
-        print("  -> No '/annunci/' links appear anywhere in the page at all.")
+    if "/id/" not in lowered:
+        print("  -> No '/id/' listing links appear anywhere in the page at all.")
     print(f"  -> First 300 characters of response:\n{html[:300]!r}")
+    # --- End diagnostics ---
 
     if status_code >= 400 or status_code == 0:
         raise RuntimeError(f"Bad response (HTTP {status_code}) for {search['url']}")
 
-    listings = parse_immobiliare(html)
+    listings = parse_gateaway(html)
     for listing in listings:
         listing["search"] = search["name"]
     return listings
@@ -255,7 +247,7 @@ def main() -> None:
     for search in SEARCHES:
         try:
             listings = fetch_search(search)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - we want to keep going on per-site failures
             print(f"Failed to fetch '{search['name']}': {exc}")
             continue
 
