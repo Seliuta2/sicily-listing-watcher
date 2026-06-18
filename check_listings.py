@@ -142,8 +142,20 @@ def parse_immobiliare(html: str) -> list[dict]:
 
 def fetch_search(search: dict) -> list[dict]:
     response = requests.get(search["url"], headers=HEADERS, timeout=25)
+
+    # --- Diagnostics: figure out what we actually received ---
+    html = response.text
+    lowered = html.lower()
+    print(f"  -> HTTP {response.status_code}, {len(html)} characters received")
+    if "captcha" in lowered or "are you a human" in lowered or "access denied" in lowered or "cloudflare" in lowered:
+        print("  -> Looks like a bot-check / block page, not the real listing page.")
+    if "/annunci/" not in lowered:
+        print("  -> No '/annunci/' links appear anywhere in the page at all.")
+    print(f"  -> First 300 characters of response:\n{html[:300]!r}")
+    # --- End diagnostics ---
+
     response.raise_for_status()
-    listings = parse_immobiliare(response.text)
+    listings = parse_immobiliare(html)
     for listing in listings:
         listing["search"] = search["name"]
     return listings
