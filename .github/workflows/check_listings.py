@@ -14,10 +14,10 @@ import json
 import os
 import re
 import smtplib
+import subprocess
 from datetime import datetime
 from email.mime.text import MIMEText
 
-import requests
 from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
@@ -140,10 +140,57 @@ def parse_immobiliare(html: str) -> list[dict]:
     return listings
 
 
+def fetch_url(url: str) -> tuple[int, str]:
+    """
+    Fetch a URL via curl rather than requests.
+
+    Some servers (Immobiliare.it included) send an HTTP 103 Early Hints
+    response before the real one, as a performance optimization — the
+    genuine 200 response with the actual page follows right after. The
+    requests/urllib3 library has a known issue where it stops at that 103
+    and never reads the real response. curl has always handled this
+    correctly, so we shell out to it instead of using requests.
+    """
+    result = subprocess.run(
+        [
+            "curl", "-s", "-L",
+            "-A", HEADERS["User-Agent"],
+            "-H", f"Accept-Language: {HEADERS['Accept-Language']}",
+            "-w", "\n__HTTP_STATUS__:%{http_code}",
+            url,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    output = result.stdout
+    marker = "\n__HTTP_STATUS__:"
+    idx = output.rfind(marker)
+    if idx == -1:
+        return 0, output
+    html = output[:idx]
+    status_code = int(output[idx + len(marker):].strip() or 0)
+    return status_code, html
+
+
 def fetch_search(search: dict) -> list[dict]:
-    response = requests.get(search["url"], headers=HEADERS, timeout=25)
-    response.raise_for_status()
-    listings = parse_immobiliare(response.text)
+    status_code, html = fetch_url(search["url"])
+
+    # --- Diagnostics: figure out what we actually received ---
+    lowered = html.lower()
+    print(f"  -> HTTP {status_code}, {len(html)} characters received")
+    if "captcha" in lowered or "are you a human" in lowered or "access denied" in lowered or "cloudflare" in lowered:
+        print("  -> Looks like a bot-check / block page, not the real listing page.")
+    if "/annunci/" not in lowered:
+        print("  -> No '/annunci/' links appear anywhere in the page at all.")
+    print(f"  -> First 300 characters of response:\n{html[:300]!r}")
+    # --- End diagnostics ---
+
+    if status_code >= 400 or status_code == 0:
+        raise RuntimeError(f"Bad response (HTTP {status_code}) for {search['url']}")
+
+    listings = parse_immobiliare(html)
     for listing in listings:
         listing["search"] = search["name"]
     return listings
